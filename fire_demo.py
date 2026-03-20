@@ -577,10 +577,10 @@ def compute_light_volume(
         transmittance = wp.exp(-accumulated * absorption)
         # Multi-scattering: each scattering event redirects some light
         # back into the medium (approximated as exponential bounce)
-        scatter_contrib = (1.0 - wp.exp(-d * absorption * 0.5)) * transmittance * 0.25
+        scatter_contrib = (1.0 - wp.exp(-d * absorption * 0.5)) * transmittance * 0.45
         scatter_accum = scatter_accum + scatter_contrib
         # Combined: direct transmittance + accumulated scattered light
-        light_vol[idx] = wp.float16(wp.clamp(transmittance + scatter_accum * 0.6, 0.0, 1.0))
+        light_vol[idx] = wp.float16(wp.clamp(transmittance + scatter_accum * 0.8, 0.0, 1.0))
         accumulated = accumulated + d
 
 
@@ -658,8 +658,8 @@ def render_fire(
         emit = wp.clamp(t * 2.0, 0.0, 1.0)
 
         # Smoke: lit by directional light + ambient + fire glow (phase_norm precomputed above)
-        ambient = 0.015
-        smoke_bright = ambient + 0.06 * light_atten * phase_norm
+        ambient = 0.025
+        smoke_bright = ambient + 0.1 * light_atten * phase_norm
         fire_illum = wp.clamp(t * 0.3, 0.0, 0.15)
         smoke_r = smoke_bright + fire_illum * 1.0
         smoke_g = smoke_bright + fire_illum * 0.4
@@ -774,7 +774,7 @@ def build_occupancy_dilated(
                             gk = nk * block_size + lk
                             if gi < n and gj < n and gk < n:
                                 idx = gi * n2 + gj * n + gk
-                                if temperature[idx] > 0.005 or density[idx] > 0.005:
+                                if temperature[idx] > 0.02 or density[idx] > 0.02:
                                     found = 1
 
     occupancy[tid] = found
@@ -1017,68 +1017,73 @@ class FireSim:
                 self.sim_occupancy,
                 n, self.frame,
                 0.8, 1.5, dt,     # buoyancy, turbulence, dt
-                0.97, 0.98, 0.96,  # temp_decay, dens_decay, vel_decay
+                0.96, 0.95, 0.94,  # temp_decay, dens_decay, vel_decay
                 self.block_size,
             ],
             device="cuda",
         )
 
-        # 2. Vorticity Confinement (2-pass)
-        wp.launch(
-            compute_vorticity, dim=total,
-            inputs=[self.vel_x, self.vel_y, self.vel_z,
-                    self.omega_x, self.omega_y, self.omega_z, self.omega_mag, n],
-            device="cuda",
-        )
-        wp.launch(
-            apply_vorticity_confinement, dim=total,
-            inputs=[self.vel_x, self.vel_y, self.vel_z,
-                    self.omega_x, self.omega_y, self.omega_z, self.omega_mag,
-                    n, 0.35, dt],
-            device="cuda",
-        )
+        # 2. Vorticity Confinement (every 2nd frame)
+        if self.frame % 2 == 0:
+            wp.launch(
+                compute_vorticity, dim=total,
+                inputs=[self.vel_x, self.vel_y, self.vel_z,
+                        self.omega_x, self.omega_y, self.omega_z, self.omega_mag, n],
+                device="cuda",
+            )
+            wp.launch(
+                apply_vorticity_confinement, dim=total,
+                inputs=[self.vel_x, self.vel_y, self.vel_z,
+                        self.omega_x, self.omega_y, self.omega_z, self.omega_mag,
+                        n, 0.5, dt],  # stronger epsilon to compensate for skipping
+                device="cuda",
+            )
 
         # 3. Diffuse velocity
         self.vel_x, self.vx_buf = self._diffuse(self.vel_x, self.vx_buf, 0.2)
         self.vel_y, self.vy_buf = self._diffuse(self.vel_y, self.vy_buf, 0.2)
         self.vel_z, self.vz_buf = self._diffuse(self.vel_z, self.vz_buf, 0.2)
 
-        # 4. Pressure projection (divergence-free velocity)
-        wp.launch(compute_divergence, dim=total,
-                  inputs=[self.vel_x, self.vel_y, self.vel_z, self.divergence, n],
-                  device="cuda")
-        self.pressure.zero_()
-        self.pressure_buf.zero_()
-        # Jacobi: 2 iterations per graph replay (swaps cancel out)
-        if self._jacobi_graph is None:
-            try:
-                wp.capture_begin(device="cuda")
-                wp.launch(jacobi_step, dim=total,
-                          inputs=[self.pressure, self.pressure_buf, self.divergence, n],
-                          device="cuda")
-                wp.launch(jacobi_step, dim=total,
-                          inputs=[self.pressure_buf, self.pressure, self.divergence, n],
-                          device="cuda")
-                self._jacobi_graph = wp.capture_end(device="cuda")
-            except Exception:
-                self._jacobi_graph = None  # fallback if graphs not supported
+        # 4. Pressure projection (every 3rd frame — most expensive step)
+        if self.frame % 3 == 0:
+            wp.launch(compute_divergence, dim=total,
+                      inputs=[self.vel_x, self.vel_y, self.vel_z, self.divergence, n],
+                      device="cuda")
+            self.pressure.zero_()
+            self.pressure_buf.zero_()
+            if self._jacobi_graph is None:
+                try:
+                    wp.capture_begin(device="cuda")
+                    wp.launch(jacobi_step, dim=total,
+                              inputs=[self.pressure, self.pressure_buf, self.divergence, n],
+                              device="cuda")
+                    wp.launch(jacobi_step, dim=total,
+                              inputs=[self.pressure_buf, self.pressure, self.divergence, n],
+                              device="cuda")
+                    self._jacobi_graph = wp.capture_end(device="cuda")
+                except Exception:
+                    self._jacobi_graph = None
 
-        if self._jacobi_graph is not None:
-            for _ in range(10):  # 10 replays x 2 iters = 20 Jacobi iterations
-                wp.capture_launch(self._jacobi_graph)
-        else:
-            for _ in range(20):
-                wp.launch(jacobi_step, dim=total,
-                          inputs=[self.pressure, self.pressure_buf, self.divergence, n],
-                          device="cuda")
-                self.pressure, self.pressure_buf = self.pressure_buf, self.pressure
-        wp.launch(subtract_pressure_gradient, dim=total,
-                  inputs=[self.vel_x, self.vel_y, self.vel_z, self.pressure, n],
-                  device="cuda")
+            if self._jacobi_graph is not None:
+                for _ in range(5):  # 5 replays x 2 iters = 10 Jacobi iterations
+                    wp.capture_launch(self._jacobi_graph)
+            else:
+                for _ in range(10):
+                    wp.launch(jacobi_step, dim=total,
+                              inputs=[self.pressure, self.pressure_buf, self.divergence, n],
+                              device="cuda")
+                    self.pressure, self.pressure_buf = self.pressure_buf, self.pressure
+            wp.launch(subtract_pressure_gradient, dim=total,
+                      inputs=[self.vel_x, self.vel_y, self.vel_z, self.pressure, n],
+                      device="cuda")
 
-        # 5. MacCormack advect temperature + density
+        # 5. MacCormack advect temperature, standard advect density
         self.temperature, self.temp_buf = self._advect_mc(self.temperature, self.temp_buf, dt)
-        self.density, self.dens_buf = self._advect_mc(self.density, self.dens_buf, dt)
+        wp.launch(advect_field, dim=total,
+                  inputs=[self.density, self.dens_buf,
+                          self.vel_x, self.vel_y, self.vel_z, n, dt],
+                  device="cuda")
+        self.density, self.dens_buf = self.dens_buf, self.density
 
         # 5. Advect velocity (fused — single backtrace for all 3 components)
         wp.launch(advect_velocity_fused, dim=total,
@@ -1097,7 +1102,7 @@ class FireSim:
         wp.launch(
             compute_light_volume,
             dim=self.n * self.n,
-            inputs=[self.density, self.light_vol, self.n, 0.8],
+            inputs=[self.density, self.light_vol, self.n, 0.4],
             device="cuda",
         )
 
@@ -1380,6 +1385,18 @@ def main():
     frame_counter = 0
     last_surf = None
 
+    # Performance logger
+    import csv
+    log_path = "/home/michael/Dokumente/Fire_Blender/perf_log.csv"
+    log_file = open(log_path, "w", newline="")
+    log_writer = csv.writer(log_file)
+    log_writer.writerow(["timestamp", "fps", "sim_ms", "render_ms", "grid", "voxels", "res", "gl", "skip"])
+    log_interval = 0.5  # log every 0.5 seconds
+    last_log_time = time.perf_counter()
+    sim_ms = 0.0
+    render_ms = 0.0
+    print(f"Performance log: {log_path}")
+
     running = True
     while running:
         for event in pygame.event.get():
@@ -1519,9 +1536,24 @@ def main():
             draw_hud_bg(screen, 4, IMG_H - 22, 440, 18)
             draw_text(screen, 8, IMG_H - 20, info_controls, (140, 140, 140))
 
+        # Performance logging
+        now = time.perf_counter()
+        if now - last_log_time >= log_interval:
+            log_writer.writerow([
+                f"{now:.2f}", f"{fps:.1f}", f"{sim_ms:.2f}", f"{render_ms:.2f}",
+                grid_size, grid_size**3,
+                "HALF" if half_res else "FULL",
+                "GL" if use_gl else "SW",
+                render_every,
+            ])
+            log_file.flush()
+            last_log_time = now
+
         pygame.display.flip()
         clock.tick(60)
 
+    log_file.close()
+    print(f"Log saved: {log_path}")
     if gl_interop is not None:
         gl_interop.cleanup()
     pygame.quit()
