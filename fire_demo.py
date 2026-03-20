@@ -179,6 +179,93 @@ def advect_field(
 
 
 @wp.kernel
+def advect_velocity_fused(
+    vel_x_src: wp.array(dtype=float),
+    vel_y_src: wp.array(dtype=float),
+    vel_z_src: wp.array(dtype=float),
+    vel_x_dst: wp.array(dtype=float),
+    vel_y_dst: wp.array(dtype=float),
+    vel_z_dst: wp.array(dtype=float),
+    vel_x: wp.array(dtype=float),
+    vel_y: wp.array(dtype=float),
+    vel_z: wp.array(dtype=float),
+    n: int,
+    dt: float,
+):
+    tid = wp.tid()
+    n2 = n * n
+    i = tid // n2
+    j = (tid // n) % n
+    k = tid % n
+
+    if i < 1 or i >= n - 1 or j < 1 or j >= n - 1 or k < 1 or k >= n - 1:
+        vel_x_dst[tid] = 0.0
+        vel_y_dst[tid] = 0.0
+        vel_z_dst[tid] = 0.0
+        return
+
+    # Single backtrace computation shared by all three components
+    px = float(i) - vel_x[tid] * dt
+    py = float(j) - vel_y[tid] * dt
+    pz = float(k) - vel_z[tid] * dt
+
+    px = wp.clamp(px, 1.0, float(n - 2))
+    py = wp.clamp(py, 1.0, float(n - 2))
+    pz = wp.clamp(pz, 1.0, float(n - 2))
+
+    i0 = int(px)
+    j0 = int(py)
+    k0 = int(pz)
+    i1 = i0 + 1
+    j1 = j0 + 1
+    k1 = k0 + 1
+
+    fx = px - float(i0)
+    fy = py - float(j0)
+    fz = pz - float(k0)
+
+    # Precompute weight combinations
+    w000 = (1.0 - fx) * (1.0 - fy) * (1.0 - fz)
+    w001 = (1.0 - fx) * (1.0 - fy) * fz
+    w010 = (1.0 - fx) * fy * (1.0 - fz)
+    w011 = (1.0 - fx) * fy * fz
+    w100 = fx * (1.0 - fy) * (1.0 - fz)
+    w101 = fx * (1.0 - fy) * fz
+    w110 = fx * fy * (1.0 - fz)
+    w111 = fx * fy * fz
+
+    # Precompute index offsets
+    idx000 = i0 * n2 + j0 * n + k0
+    idx001 = i0 * n2 + j0 * n + k1
+    idx010 = i0 * n2 + j1 * n + k0
+    idx011 = i0 * n2 + j1 * n + k1
+    idx100 = i1 * n2 + j0 * n + k0
+    idx101 = i1 * n2 + j0 * n + k1
+    idx110 = i1 * n2 + j1 * n + k0
+    idx111 = i1 * n2 + j1 * n + k1
+
+    # Interpolate all three velocity components with shared weights and indices
+    vel_x_dst[tid] = (
+        vel_x_src[idx000] * w000 + vel_x_src[idx001] * w001
+        + vel_x_src[idx010] * w010 + vel_x_src[idx011] * w011
+        + vel_x_src[idx100] * w100 + vel_x_src[idx101] * w101
+        + vel_x_src[idx110] * w110 + vel_x_src[idx111] * w111
+    )
+    vel_y_dst[tid] = (
+        vel_y_src[idx000] * w000 + vel_y_src[idx001] * w001
+        + vel_y_src[idx010] * w010 + vel_y_src[idx011] * w011
+        + vel_y_src[idx100] * w100 + vel_y_src[idx101] * w101
+        + vel_y_src[idx110] * w110 + vel_y_src[idx111] * w111
+    )
+    vel_z_dst[tid] = (
+        vel_z_src[idx000] * w000 + vel_z_src[idx001] * w001
+        + vel_z_src[idx010] * w010 + vel_z_src[idx011] * w011
+        + vel_z_src[idx100] * w100 + vel_z_src[idx101] * w101
+        + vel_z_src[idx110] * w110 + vel_z_src[idx111] * w111
+    )
+
+
+@wp.kernel
 def compute_vorticity(
     vel_x: wp.array(dtype=float),
     vel_y: wp.array(dtype=float),
@@ -493,7 +580,7 @@ def compute_light_volume(
         scatter_contrib = (1.0 - wp.exp(-d * absorption * 0.5)) * transmittance * 0.25
         scatter_accum = scatter_accum + scatter_contrib
         # Combined: direct transmittance + accumulated scattered light
-        light_vol[idx] = wp.float16(transmittance + scatter_accum * 0.6)
+        light_vol[idx] = wp.float16(wp.clamp(transmittance + scatter_accum * 0.6, 0.0, 1.0))
         accumulated = accumulated + d
 
 
@@ -527,6 +614,14 @@ def render_fire(
     b = float(0.0)
     alpha = float(0.0)
     step = float(n) * 0.008
+
+    # Henyey-Greenstein phase function (loop-invariant — compute once)
+    g_param = 0.35  # forward scattering bias
+    cos_theta = 0.36  # Z-component of light direction (fixed for Z-view)
+    g2 = g_param * g_param
+    denom = 1.0 + g2 - 2.0 * g_param * cos_theta
+    phase = (1.0 - g2) / (4.0 * 3.14159 * denom * wp.sqrt(denom))
+    phase_norm = phase * 4.0  # normalize so backlit smoke glows
 
     occ_dim = n // block_size
     occ_bi = gi // block_size
@@ -562,17 +657,7 @@ def render_fire(
         cb = wp.clamp(t * 1.2 - 0.5, 0.0, 1.0)
         emit = wp.clamp(t * 2.0, 0.0, 1.0)
 
-        # Henyey-Greenstein phase function for anisotropic scattering
-        # View direction is along Z (into screen), light from upper-right
-        # cos_theta = dot(view_dir, light_dir) ≈ lz component for Z-aligned view
-        g_param = 0.35  # forward scattering bias
-        cos_theta = 0.36  # Z-component of light direction (fixed for Z-view)
-        g2 = g_param * g_param
-        denom = 1.0 + g2 - 2.0 * g_param * cos_theta
-        phase = (1.0 - g2) / (4.0 * 3.14159 * denom * wp.sqrt(denom))
-        phase_norm = phase * 4.0  # normalize so backlit smoke glows
-
-        # Smoke: lit by directional light + ambient + fire glow
+        # Smoke: lit by directional light + ambient + fire glow (phase_norm precomputed above)
         ambient = 0.015
         smoke_bright = ambient + 0.06 * light_atten * phase_norm
         fire_illum = wp.clamp(t * 0.3, 0.0, 0.15)
@@ -674,22 +759,23 @@ def build_occupancy_dilated(
                 nk = bk + dk - 1
                 if ni < 0 or ni >= blocks_per_dim or nj < 0 or nj >= blocks_per_dim or nk < 0 or nk >= blocks_per_dim:
                     continue
-                # Sample center of neighbor block
-                gi = ni * block_size + block_size // 2
-                gj = nj * block_size + block_size // 2
-                gk = nk * block_size + block_size // 2
-                if gi < n and gj < n and gk < n:
-                    idx = gi * n2 + gj * n + gk
-                    if temperature[idx] > 0.005 or density[idx] > 0.005:
-                        found = 1
-                # Also sample corners for better coverage
-                gi2 = ni * block_size
-                gj2 = nj * block_size
-                gk2 = nk * block_size
-                if gi2 < n and gj2 < n and gk2 < n:
-                    idx2 = gi2 * n2 + gj2 * n + gk2
-                    if temperature[idx2] > 0.005 or density[idx2] > 0.005:
-                        found = 1
+                # Iterate all voxels in neighbor block, early-exit on first hit
+                for li in range(block_size):
+                    if found == 1:
+                        break
+                    for lj in range(block_size):
+                        if found == 1:
+                            break
+                        for lk in range(block_size):
+                            if found == 1:
+                                break
+                            gi = ni * block_size + li
+                            gj = nj * block_size + lj
+                            gk = nk * block_size + lk
+                            if gi < n and gj < n and gk < n:
+                                idx = gi * n2 + gj * n + gk
+                                if temperature[idx] > 0.005 or density[idx] > 0.005:
+                                    found = 1
 
     occupancy[tid] = found
 
@@ -877,6 +963,7 @@ class FireSim:
         self.occ_total = occ_dim * occ_dim * occ_dim
         self.occupancy = wp.zeros(self.occ_total, dtype=int, device="cuda")
         self.sim_occupancy = wp.zeros(self.occ_total, dtype=int, device="cuda")
+        self._jacobi_graph = None
 
     def reset(self):
         self.frame = 0
@@ -963,7 +1050,7 @@ class FireSim:
         self.pressure.zero_()
         self.pressure_buf.zero_()
         # Jacobi: 2 iterations per graph replay (swaps cancel out)
-        if not hasattr(self, '_jacobi_graph'):
+        if self._jacobi_graph is None:
             try:
                 wp.capture_begin(device="cuda")
                 wp.launch(jacobi_step, dim=total,
@@ -993,15 +1080,11 @@ class FireSim:
         self.temperature, self.temp_buf = self._advect_mc(self.temperature, self.temp_buf, dt)
         self.density, self.dens_buf = self._advect_mc(self.density, self.dens_buf, dt)
 
-        # 5. Advect velocity (standard semi-lagrangian — MacCormack too expensive for 3 fields)
-        wp.launch(advect_field, dim=total,
-                  inputs=[self.vel_x, self.vx_buf, self.vel_x, self.vel_y, self.vel_z, n, dt],
-                  device="cuda")
-        wp.launch(advect_field, dim=total,
-                  inputs=[self.vel_y, self.vy_buf, self.vel_x, self.vel_y, self.vel_z, n, dt],
-                  device="cuda")
-        wp.launch(advect_field, dim=total,
-                  inputs=[self.vel_z, self.vz_buf, self.vel_x, self.vel_y, self.vel_z, n, dt],
+        # 5. Advect velocity (fused — single backtrace for all 3 components)
+        wp.launch(advect_velocity_fused, dim=total,
+                  inputs=[self.vel_x, self.vel_y, self.vel_z,
+                          self.vx_buf, self.vy_buf, self.vz_buf,
+                          self.vel_x, self.vel_y, self.vel_z, n, dt],
                   device="cuda")
         self.vel_x, self.vx_buf = self.vx_buf, self.vel_x
         self.vel_y, self.vy_buf = self.vy_buf, self.vel_y
@@ -1123,7 +1206,8 @@ class GLInterop:
         from OpenGL.GL import (
             glGenBuffers, glBindBuffer, glBufferData, glGenTextures,
             glBindTexture, glTexImage2D, glTexParameteri, glTexSubImage2D,
-            glEnable, glBegin, glEnd, glVertex2f, glTexCoord2f,
+            glEnable, glDisable, glBegin, glEnd, glVertex2f, glTexCoord2f,
+            glDeleteBuffers, glDeleteTextures,
             GL_PIXEL_UNPACK_BUFFER, GL_DYNAMIC_DRAW, GL_TEXTURE_2D,
             GL_RGB32F, GL_RGB, GL_FLOAT, GL_TEXTURE_MIN_FILTER,
             GL_TEXTURE_MAG_FILTER, GL_LINEAR, GL_QUADS,
@@ -1131,8 +1215,11 @@ class GLInterop:
         self.gl = {
             'glBindBuffer': glBindBuffer, 'glBindTexture': glBindTexture,
             'glTexSubImage2D': glTexSubImage2D, 'glEnable': glEnable,
+            'glDisable': glDisable,
             'glBegin': glBegin, 'glEnd': glEnd, 'glVertex2f': glVertex2f,
             'glTexCoord2f': glTexCoord2f,
+            'glDeleteBuffers': glDeleteBuffers,
+            'glDeleteTextures': glDeleteTextures,
             'GL_PIXEL_UNPACK_BUFFER': GL_PIXEL_UNPACK_BUFFER,
             'GL_TEXTURE_2D': GL_TEXTURE_2D, 'GL_RGB': GL_RGB,
             'GL_FLOAT': GL_FLOAT, 'GL_QUADS': GL_QUADS,
@@ -1207,6 +1294,25 @@ class GLInterop:
         gl['glTexCoord2f'](1, 0); gl['glVertex2f'](1, 1)
         gl['glTexCoord2f'](0, 0); gl['glVertex2f'](-1, 1)
         gl['glEnd']()
+        gl['glBindTexture'](gl['GL_TEXTURE_2D'], 0)
+        gl['glDisable'](gl['GL_TEXTURE_2D'])
+
+    def cleanup(self):
+        """Release CUDA-GL resource, PBO, and texture."""
+        ct = self.ctypes
+        gl = self.gl
+        # Unregister CUDA graphics resource
+        if self._resource:
+            self._cudart.cudaGraphicsUnregisterResource(self._resource)
+            self._resource = None
+        # Delete PBO
+        if self.pbo:
+            gl['glDeleteBuffers'](1, [int(self.pbo)])
+            self.pbo = None
+        # Delete texture
+        if self.texture:
+            gl['glDeleteTextures'](1, [int(self.texture)])
+            self.texture = None
 
 
 def main():
@@ -1416,6 +1522,8 @@ def main():
         pygame.display.flip()
         clock.tick(60)
 
+    if gl_interop is not None:
+        gl_interop.cleanup()
     pygame.quit()
 
 
