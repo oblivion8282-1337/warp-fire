@@ -186,16 +186,17 @@ def advect_field(
 
 
 @wp.kernel
-def advect_velocity_fused(
+def advect_all_fused(
+    temp_src: wp.array(dtype=float),
+    temp_dst: wp.array(dtype=float),
+    dens_src: wp.array(dtype=float),
+    dens_dst: wp.array(dtype=float),
     vel_x_src: wp.array(dtype=float),
     vel_y_src: wp.array(dtype=float),
     vel_z_src: wp.array(dtype=float),
     vel_x_dst: wp.array(dtype=float),
     vel_y_dst: wp.array(dtype=float),
     vel_z_dst: wp.array(dtype=float),
-    vel_x: wp.array(dtype=float),
-    vel_y: wp.array(dtype=float),
-    vel_z: wp.array(dtype=float),
     n: int,
     dt: float,
     sim_occupancy: wp.array(dtype=int),
@@ -208,21 +209,25 @@ def advect_velocity_fused(
     k = tid % n
 
     if block_is_active(sim_occupancy, i, j, k, n, block_size) == 0:
+        temp_dst[tid] = 0.0
+        dens_dst[tid] = 0.0
         vel_x_dst[tid] = 0.0
         vel_y_dst[tid] = 0.0
         vel_z_dst[tid] = 0.0
         return
 
     if i < 1 or i >= n - 1 or j < 1 or j >= n - 1 or k < 1 or k >= n - 1:
+        temp_dst[tid] = 0.0
+        dens_dst[tid] = 0.0
         vel_x_dst[tid] = 0.0
         vel_y_dst[tid] = 0.0
         vel_z_dst[tid] = 0.0
         return
 
-    # Single backtrace computation shared by all three components
-    px = float(i) - vel_x[tid] * dt
-    py = float(j) - vel_y[tid] * dt
-    pz = float(k) - vel_z[tid] * dt
+    # Single backtrace computation shared by all 5 fields
+    px = float(i) - vel_x_src[tid] * dt
+    py = float(j) - vel_y_src[tid] * dt
+    pz = float(k) - vel_z_src[tid] * dt
 
     px = wp.clamp(px, 1.0, float(n - 2))
     py = wp.clamp(py, 1.0, float(n - 2))
@@ -259,7 +264,19 @@ def advect_velocity_fused(
     idx110 = i1 * n2 + j1 * n + k0
     idx111 = i1 * n2 + j1 * n + k1
 
-    # Interpolate all three velocity components with shared weights and indices
+    # Interpolate all 5 fields with shared weights and indices
+    temp_dst[tid] = (
+        temp_src[idx000] * w000 + temp_src[idx001] * w001
+        + temp_src[idx010] * w010 + temp_src[idx011] * w011
+        + temp_src[idx100] * w100 + temp_src[idx101] * w101
+        + temp_src[idx110] * w110 + temp_src[idx111] * w111
+    )
+    dens_dst[tid] = (
+        dens_src[idx000] * w000 + dens_src[idx001] * w001
+        + dens_src[idx010] * w010 + dens_src[idx011] * w011
+        + dens_src[idx100] * w100 + dens_src[idx101] * w101
+        + dens_src[idx110] * w110 + dens_src[idx111] * w111
+    )
     vel_x_dst[tid] = (
         vel_x_src[idx000] * w000 + vel_x_src[idx001] * w001
         + vel_x_src[idx010] * w010 + vel_x_src[idx011] * w011
@@ -1316,27 +1333,17 @@ class FireSim:
                               self.sim_occupancy, self.block_size],
                       device="cuda")
 
-        # 5. Standard advect temperature and density
-        wp.launch(advect_field, dim=total,
+        # 5. Advect all fields (temp, density, velocity) in single kernel
+        wp.launch(advect_all_fused, dim=total,
                   inputs=[self.temperature, self.temp_buf,
-                          self.vel_x, self.vel_y, self.vel_z, n, dt,
+                          self.density, self.dens_buf,
+                          self.vel_x, self.vel_y, self.vel_z,
+                          self.vx_buf, self.vy_buf, self.vz_buf,
+                          n, dt,
                           self.sim_occupancy, self.block_size],
                   device="cuda")
         self.temperature, self.temp_buf = self.temp_buf, self.temperature
-        wp.launch(advect_field, dim=total,
-                  inputs=[self.density, self.dens_buf,
-                          self.vel_x, self.vel_y, self.vel_z, n, dt,
-                          self.sim_occupancy, self.block_size],
-                  device="cuda")
         self.density, self.dens_buf = self.dens_buf, self.density
-
-        # 5. Advect velocity (fused — single backtrace for all 3 components)
-        wp.launch(advect_velocity_fused, dim=total,
-                  inputs=[self.vel_x, self.vel_y, self.vel_z,
-                          self.vx_buf, self.vy_buf, self.vz_buf,
-                          self.vel_x, self.vel_y, self.vel_z, n, dt,
-                          self.sim_occupancy, self.block_size],
-                  device="cuda")
         self.vel_x, self.vx_buf = self.vx_buf, self.vel_x
         self.vel_y, self.vy_buf = self.vy_buf, self.vel_y
         self.vel_z, self.vz_buf = self.vz_buf, self.vel_z
