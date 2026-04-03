@@ -17,6 +17,7 @@ import warp as wp
 import numpy as np
 import time
 import sys
+import os
 
 wp.init()
 
@@ -1315,8 +1316,13 @@ class FireSim:
                               self.sim_occupancy, self.block_size],
                       device="cuda")
 
-        # 5. MacCormack advect temperature, standard advect density
-        self.temperature, self.temp_buf = self._advect_mc(self.temperature, self.temp_buf, dt)
+        # 5. Standard advect temperature and density
+        wp.launch(advect_field, dim=total,
+                  inputs=[self.temperature, self.temp_buf,
+                          self.vel_x, self.vel_y, self.vel_z, n, dt,
+                          self.sim_occupancy, self.block_size],
+                  device="cuda")
+        self.temperature, self.temp_buf = self.temp_buf, self.temperature
         wp.launch(advect_field, dim=total,
                   inputs=[self.density, self.dens_buf,
                           self.vel_x, self.vel_y, self.vel_z, n, dt,
@@ -1617,9 +1623,21 @@ def main():
 
     def set_grid(idx):
         nonlocal grid_size, grid_idx, sim
-        grid_idx = max(0, min(idx, len(grid_sizes) - 1))
-        grid_size = grid_sizes[grid_idx]
-        sim = FireSim(grid_size)
+        new_idx = max(0, min(idx, len(grid_sizes) - 1))
+        new_size = grid_sizes[new_idx]
+        old_sim = sim
+        new_sim = None
+        try:
+            new_sim = FireSim(new_size)
+        except RuntimeError as e:
+            print(f"Grid {new_size}³ failed (VRAM): {e}")
+            del new_sim
+            import gc; gc.collect()
+            wp.synchronize()
+            return
+        sim = new_sim
+        grid_idx = new_idx
+        grid_size = new_size
 
     render_every = 1  # render every N-th frame (1=every frame)
     frame_counter = 0
@@ -1627,7 +1645,7 @@ def main():
 
     # Performance logger
     import csv
-    log_path = "/home/michael/Dokumente/Fire_Blender/perf_log.csv"
+    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "perf_log.csv")
     log_file = open(log_path, "w", newline="")
     log_writer = csv.writer(log_file)
     log_writer.writerow(["timestamp", "fps", "sim_ms", "render_ms", "grid", "voxels", "res", "gl", "skip"])
@@ -1712,8 +1730,11 @@ def main():
         res_str = "HALF" if half_res else "FULL"
         gl_str = " GL" if use_gl else ""
         temp_str = f"  SKIP:{render_every}" if render_every > 1 else ""
+        cuda_dev = wp.get_device("cuda:0")
+        vram_used_mb = (cuda_dev.total_memory - cuda_dev.free_memory) / (1024 * 1024)
+        vram_total_gb = cuda_dev.total_memory / (1024 * 1024 * 1024)
         info_top = f"FPS: {fps:.0f}  Sim: {sim_ms:.1f}ms  Render: {render_ms:.1f}ms"
-        info_grid = f"Grid: {grid_size}^3 ({voxel_str})  Res: {res_str}{gl_str}{temp_str}"
+        info_grid = f"Grid: {grid_size}^3 ({voxel_str})  {res_str}{gl_str}  VRAM: {vram_used_mb:.0f}MB/{vram_total_gb:.1f}GB{temp_str}"
         info_controls = "Up/Down=Grid  H=HalfRes  T=Temporal  R=Reset  ESC=Quit"
 
         if use_gl:
@@ -1745,6 +1766,8 @@ def main():
                 glEnd()
 
             def gl_draw_text(x, y, text, cr, cg, cb, scale=2):
+                glColor4f(cr, cg, cb, 1.0)
+                glBegin(GL_QUADS)
                 cx = x
                 for ch in text.upper():
                     glyph = _GLYPHS.get(ch)
@@ -1754,14 +1777,17 @@ def main():
                     for row_i, row in enumerate(glyph):
                         for col in range(5):
                             if row & (0x10 >> col):
-                                gl_draw_rect(cx + col*scale, y + row_i*scale,
-                                             scale, scale, cr, cg, cb, 1.0)
+                                px = cx + col * scale
+                                py = y + row_i * scale
+                                glVertex2f(px, py); glVertex2f(px + scale, py)
+                                glVertex2f(px + scale, py + scale); glVertex2f(px, py + scale)
                     cx += 6 * scale
+                glEnd()
 
-            gl_draw_rect(4, 4, 420, 40, 0, 0, 0, 0.55)
+            gl_draw_rect(4, 4, 500, 40, 0, 0, 0, 0.55)
             gl_draw_text(8, 6, info_top, 1.0, 1.0, 1.0)
             gl_draw_text(8, 22, info_grid, 0.7, 0.7, 0.7)
-            gl_draw_rect(4, IMG_H - 22, 440, 18, 0, 0, 0, 0.55)
+            gl_draw_rect(4, IMG_H - 22, 580, 18, 0, 0, 0, 0.55)
             gl_draw_text(8, IMG_H - 20, info_controls, 0.55, 0.55, 0.55)
 
             glDisable(GL_BLEND)
@@ -1770,10 +1796,10 @@ def main():
             glMatrixMode(GL_MODELVIEW)
             glPopMatrix()
         else:
-            draw_hud_bg(screen, 4, 4, 420, 40)
+            draw_hud_bg(screen, 4, 4, 500, 40)
             draw_text(screen, 8, 6, info_top, (255, 255, 255))
             draw_text(screen, 8, 22, info_grid, (180, 180, 180))
-            draw_hud_bg(screen, 4, IMG_H - 22, 440, 18)
+            draw_hud_bg(screen, 4, IMG_H - 22, 580, 18)
             draw_text(screen, 8, IMG_H - 20, info_controls, (140, 140, 140))
 
         # Performance logging
@@ -1790,7 +1816,7 @@ def main():
             last_log_time = now
 
         pygame.display.flip()
-        clock.tick(60)
+        clock.tick(0)
 
     log_file.close()
     print(f"Log saved: {log_path}")
