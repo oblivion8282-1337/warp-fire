@@ -1584,8 +1584,8 @@ class GLInterop:
 def main():
     import pygame
 
-    IMG_W, IMG_H = 512, 512
-    HALF_W, HALF_H = 256, 256
+    IMG_W, IMG_H = 1024, 1024
+    HALF_W, HALF_H = 512, 512
     grid_size = 128
     half_res = False
 
@@ -1753,63 +1753,9 @@ def main():
         info_controls = "Up/Down=Grid  H=HalfRes  T=Temporal  R=Reset  ESC=Quit"
 
         if use_gl:
-            # Draw HUD with OpenGL
-            from OpenGL.GL import (
-                glMatrixMode, glPushMatrix, glPopMatrix, glLoadIdentity,
-                glOrtho, glEnable, glDisable, glBlendFunc, glColor4f, glColor3f,
-                glBegin, glEnd, glVertex2f,
-                GL_PROJECTION, GL_MODELVIEW, GL_BLEND, GL_TEXTURE_2D,
-                GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_QUADS,
-            )
-            # Switch to 2D ortho projection
-            glMatrixMode(GL_PROJECTION)
-            glPushMatrix()
-            glLoadIdentity()
-            glOrtho(0, IMG_W, IMG_H, 0, -1, 1)
-            glMatrixMode(GL_MODELVIEW)
-            glPushMatrix()
-            glLoadIdentity()
-            glDisable(GL_TEXTURE_2D)
-            glEnable(GL_BLEND)
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-
-            def gl_draw_rect(x, y, w, h, r, g, b, a):
-                glColor4f(r, g, b, a)
-                glBegin(GL_QUADS)
-                glVertex2f(x, y); glVertex2f(x+w, y)
-                glVertex2f(x+w, y+h); glVertex2f(x, y+h)
-                glEnd()
-
-            def gl_draw_text(x, y, text, cr, cg, cb, scale=2):
-                glColor4f(cr, cg, cb, 1.0)
-                glBegin(GL_QUADS)
-                cx = x
-                for ch in text.upper():
-                    glyph = _GLYPHS.get(ch)
-                    if glyph is None:
-                        cx += 4 * scale
-                        continue
-                    for row_i, row in enumerate(glyph):
-                        for col in range(5):
-                            if row & (0x10 >> col):
-                                px = cx + col * scale
-                                py = y + row_i * scale
-                                glVertex2f(px, py); glVertex2f(px + scale, py)
-                                glVertex2f(px + scale, py + scale); glVertex2f(px, py + scale)
-                    cx += 6 * scale
-                glEnd()
-
-            gl_draw_rect(4, 4, 500, 40, 0, 0, 0, 0.55)
-            gl_draw_text(8, 6, info_top, 1.0, 1.0, 1.0)
-            gl_draw_text(8, 22, info_grid, 0.7, 0.7, 0.7)
-            gl_draw_rect(4, IMG_H - 22, 580, 18, 0, 0, 0, 0.55)
-            gl_draw_text(8, IMG_H - 20, info_controls, 0.55, 0.55, 0.55)
-
-            glDisable(GL_BLEND)
-            glMatrixMode(GL_PROJECTION)
-            glPopMatrix()
-            glMatrixMode(GL_MODELVIEW)
-            glPopMatrix()
+            # GL mode: HUD in window title (zero render cost)
+            pygame.display.set_caption(
+                f"Warp Fire | {info_top} | {info_grid}")
         else:
             draw_hud_bg(screen, 4, 4, 500, 40)
             draw_text(screen, 8, 6, info_top, (255, 255, 255))
@@ -1829,6 +1775,7 @@ def main():
             ])
             log_file.flush()
             last_log_time = now
+            print(f"\r{info_top} | {info_grid}", end="", flush=True)
 
         pygame.display.flip()
         clock.tick(0)
