@@ -873,18 +873,18 @@ def render_fire(
 
         # Smoke: variable color based on temperature and height
         height_frac = float(gj) / float(n)  # 0=bottom, 1=top
-        ambient = 0.02 + 0.01 * (1.0 - height_frac)  # brighter near bottom
-        smoke_bright = ambient + 0.12 * light_atten * phase_norm
-        # Fire illumination on nearby smoke (stronger than before)
-        fire_illum = wp.clamp(t * 0.6, 0.0, 0.35)
-        # Smoke darkens with height (cooler, denser particles)
-        smoke_albedo = 0.8 - 0.4 * height_frac
+        ambient = 0.06 + 0.03 * (1.0 - height_frac)
+        smoke_bright = ambient + 0.2 * light_atten * phase_norm
+        # Fire illumination on nearby smoke
+        fire_illum = wp.clamp(t * 0.8, 0.0, 0.5)
+        # Smoke slightly darkens with height but stays visible
+        smoke_albedo = 0.9 - 0.25 * height_frac
         smoke_r = (smoke_bright + fire_illum * 1.0) * smoke_albedo
         smoke_g = (smoke_bright + fire_illum * 0.35) * smoke_albedo
         smoke_b = (smoke_bright + fire_illum * 0.1) * smoke_albedo
 
         fire_a = wp.clamp(t * 0.6, 0.0, 1.0) * step
-        smoke_a = wp.clamp(d * 0.2, 0.0, 0.4) * step
+        smoke_a = wp.clamp(d * 0.5, 0.0, 0.6) * step
 
         sa = fire_a + smoke_a
         if sa > 0.0:
@@ -1332,7 +1332,7 @@ class FireSim:
                 self.active_list,
                 n, self.frame,
                 0.8, 2.5, dt,     # buoyancy, turbulence, dt
-                0.96, 0.95, 0.94,  # temp_decay, dens_decay, vel_decay
+                0.96, 0.985, 0.94,  # temp_decay, dens_decay, vel_decay
                 self.block_size,
             ],
             device="cuda",
