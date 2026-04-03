@@ -1227,6 +1227,7 @@ class FireSim:
         wp.launch(compact_active_blocks, dim=self.occ_total,
                   inputs=[self.sim_occupancy, self.active_list, self.active_counter],
                   device="cuda")
+        wp.synchronize()
         self.num_active_blocks = int(self.active_counter.numpy()[0])
         active_voxels = self.num_active_blocks * self.block_size ** 3
 
