@@ -54,7 +54,7 @@ def sim_step_fused(
     vel_x: wp.array(dtype=float),
     vel_y: wp.array(dtype=float),
     vel_z: wp.array(dtype=float),
-    sim_occupancy: wp.array(dtype=int),
+    active_list: wp.array(dtype=int),
     n: int,
     frame: int,
     buoyancy: float,
@@ -66,15 +66,7 @@ def sim_step_fused(
     block_size: int,
 ):
     """Fused: emit + forces + dissipate in one kernel (saves launch overhead)."""
-    tid = wp.tid()
-    n2 = n * n
-    i = tid // n2
-    j = (tid // n) % n
-    k = tid % n
-
-    # Sparse: skip inactive blocks (except emission zone)
-    if j >= 8 and block_is_active(sim_occupancy, i, j, k, n, block_size) == 0:
-        return
+    i, j, k, tid = voxel_from_active_tid(active_list, wp.tid(), n, block_size)
 
     t = temperature[tid]
     d = density[tid]
@@ -197,24 +189,13 @@ def advect_all_fused(
     vel_x_dst: wp.array(dtype=float),
     vel_y_dst: wp.array(dtype=float),
     vel_z_dst: wp.array(dtype=float),
+    active_list: wp.array(dtype=int),
     n: int,
     dt: float,
-    sim_occupancy: wp.array(dtype=int),
     block_size: int,
 ):
-    tid = wp.tid()
+    i, j, k, tid = voxel_from_active_tid(active_list, wp.tid(), n, block_size)
     n2 = n * n
-    i = tid // n2
-    j = (tid // n) % n
-    k = tid % n
-
-    if block_is_active(sim_occupancy, i, j, k, n, block_size) == 0:
-        temp_dst[tid] = 0.0
-        dens_dst[tid] = 0.0
-        vel_x_dst[tid] = 0.0
-        vel_y_dst[tid] = 0.0
-        vel_z_dst[tid] = 0.0
-        return
 
     if i < 1 or i >= n - 1 or j < 1 or j >= n - 1 or k < 1 or k >= n - 1:
         temp_dst[tid] = 0.0
@@ -306,23 +287,13 @@ def compute_vorticity(
     omega_y: wp.array(dtype=float),
     omega_z: wp.array(dtype=float),
     omega_mag: wp.array(dtype=float),
+    active_list: wp.array(dtype=int),
     n: int,
-    sim_occupancy: wp.array(dtype=int),
     block_size: int,
 ):
     """Pass 1: compute curl of velocity and its magnitude."""
-    tid = wp.tid()
+    i, j, k, tid = voxel_from_active_tid(active_list, wp.tid(), n, block_size)
     n2 = n * n
-    i = tid // n2
-    j = (tid // n) % n
-    k = tid % n
-
-    if block_is_active(sim_occupancy, i, j, k, n, block_size) == 0:
-        omega_x[tid] = 0.0
-        omega_y[tid] = 0.0
-        omega_z[tid] = 0.0
-        omega_mag[tid] = 0.0
-        return
 
     if i < 1 or i >= n - 1 or j < 1 or j >= n - 1 or k < 1 or k >= n - 1:
         omega_x[tid] = 0.0
@@ -353,21 +324,15 @@ def apply_vorticity_confinement(
     omega_y: wp.array(dtype=float),
     omega_z: wp.array(dtype=float),
     omega_mag: wp.array(dtype=float),
+    active_list: wp.array(dtype=int),
     n: int,
     epsilon: float,
     dt: float,
-    sim_occupancy: wp.array(dtype=int),
     block_size: int,
 ):
     """Pass 2: gradient of |omega|, then cross product for confinement force."""
-    tid = wp.tid()
+    i, j, k, tid = voxel_from_active_tid(active_list, wp.tid(), n, block_size)
     n2 = n * n
-    i = tid // n2
-    j = (tid // n) % n
-    k = tid % n
-
-    if block_is_active(sim_occupancy, i, j, k, n, block_size) == 0:
-        return
 
     if i < 2 or i >= n - 2 or j < 2 or j >= n - 2 or k < 2 or k >= n - 2:
         return
@@ -516,19 +481,12 @@ def compute_divergence(
     vel_y: wp.array(dtype=float),
     vel_z: wp.array(dtype=float),
     div: wp.array(dtype=float),
+    active_list: wp.array(dtype=int),
     n: int,
-    sim_occupancy: wp.array(dtype=int),
     block_size: int,
 ):
-    tid = wp.tid()
+    i, j, k, tid = voxel_from_active_tid(active_list, wp.tid(), n, block_size)
     n2 = n * n
-    i = tid // n2
-    j = (tid // n) % n
-    k = tid % n
-
-    if block_is_active(sim_occupancy, i, j, k, n, block_size) == 0:
-        div[tid] = 0.0
-        return
 
     if i < 1 or i >= n - 1 or j < 1 or j >= n - 1 or k < 1 or k >= n - 1:
         div[tid] = 0.0
@@ -582,18 +540,12 @@ def subtract_pressure_gradient(
     vel_y: wp.array(dtype=float),
     vel_z: wp.array(dtype=float),
     pressure: wp.array(dtype=float),
+    active_list: wp.array(dtype=int),
     n: int,
-    sim_occupancy: wp.array(dtype=int),
     block_size: int,
 ):
-    tid = wp.tid()
+    i, j, k, tid = voxel_from_active_tid(active_list, wp.tid(), n, block_size)
     n2 = n * n
-    i = tid // n2
-    j = (tid // n) % n
-    k = tid % n
-
-    if block_is_active(sim_occupancy, i, j, k, n, block_size) == 0:
-        return
 
     if i < 1 or i >= n - 1 or j < 1 or j >= n - 1 or k < 1 or k >= n - 1:
         return
@@ -721,22 +673,13 @@ def diffuse_velocity_fused(
     vx_out: wp.array(dtype=float),
     vy_out: wp.array(dtype=float),
     vz_out: wp.array(dtype=float),
+    active_list: wp.array(dtype=int),
     n: int,
     rate: float,
-    sim_occupancy: wp.array(dtype=int),
     block_size: int,
 ):
-    tid = wp.tid()
+    i, j, k, tid = voxel_from_active_tid(active_list, wp.tid(), n, block_size)
     n2 = n * n
-    i = tid // n2
-    j = (tid // n) % n
-    k = tid % n
-
-    if block_is_active(sim_occupancy, i, j, k, n, block_size) == 0:
-        vx_out[tid] = 0.0
-        vy_out[tid] = 0.0
-        vz_out[tid] = 0.0
-        return
 
     if i < 1 or i >= n - 1 or j < 1 or j >= n - 1 or k < 1 or k >= n - 1:
         vx_out[tid] = 0.0
@@ -985,6 +928,50 @@ def block_is_active(
 
 
 @wp.kernel
+def compact_active_blocks(
+    occupancy: wp.array(dtype=int),
+    active_list: wp.array(dtype=int),
+    counter: wp.array(dtype=int),
+):
+    """Stream compaction: build compact list of active block indices."""
+    tid = wp.tid()
+    if occupancy[tid] == 1:
+        slot = wp.atomic_add(counter, 0, 1)
+        active_list[slot] = tid
+
+
+@wp.func
+def voxel_from_active_tid(
+    active_list: wp.array(dtype=int),
+    tid: int,
+    n: int,
+    block_size: int,
+):
+    """Convert active-block thread ID to global (i, j, k, flat_idx)."""
+    bs3 = block_size * block_size * block_size
+    block_slot = tid // bs3
+    local_id = tid - block_slot * bs3
+
+    block_idx = active_list[block_slot]
+    bpd = n // block_size
+    bi = block_idx // (bpd * bpd)
+    bj = (block_idx // bpd) % bpd
+    bk = block_idx % bpd
+
+    li = local_id // (block_size * block_size)
+    lj = (local_id // block_size) % block_size
+    lk = local_id % block_size
+
+    i = bi * block_size + li
+    j = bj * block_size + lj
+    k = bk * block_size + lk
+
+    n2 = n * n
+    flat = i * n2 + j * n + k
+    return i, j, k, flat
+
+
+@wp.kernel
 def bloom_threshold(
     image: wp.array(dtype=wp.vec3),
     bright: wp.array(dtype=wp.vec3),
@@ -1151,6 +1138,9 @@ class FireSim:
         self.occupancy = wp.zeros(self.occ_total, dtype=int, device="cuda")
         self.sim_occupancy = wp.zeros(self.occ_total, dtype=int, device="cuda")
         self.occ_undilated = wp.zeros(self.occ_total, dtype=int, device="cuda")
+        self.active_list = wp.array(np.arange(self.occ_total, dtype=np.int32), dtype=int, device="cuda")
+        self.active_counter = wp.zeros(1, dtype=int, device="cuda")
+        self.num_active_blocks = self.occ_total
         self._jacobi_graph = None
 
         # Half-resolution buffers for multi-resolution pressure solve
@@ -1204,14 +1194,15 @@ class FireSim:
         total = self.total
         dt = 0.25
 
-        # 1. Fused: emit + forces + dissipate (runs BEFORE occupancy — emission must happen first)
+        # 1. Fused: emit + forces + dissipate (uses active list from previous frame)
+        active_voxels_prev = self.num_active_blocks * self.block_size ** 3
         wp.launch(
             sim_step_fused,
-            dim=total,
+            dim=active_voxels_prev,
             inputs=[
                 self.temperature, self.density,
                 self.vel_x, self.vel_y, self.vel_z,
-                self.sim_occupancy,
+                self.active_list,
                 n, self.frame,
                 0.8, 1.5, dt,     # buoyancy, turbulence, dt
                 0.96, 0.95, 0.94,  # temp_decay, dens_decay, vel_decay
@@ -1231,31 +1222,40 @@ class FireSim:
                           n // self.block_size],
                   device="cuda")
 
+        # Compact active block list
+        self.active_counter.zero_()
+        wp.launch(compact_active_blocks, dim=self.occ_total,
+                  inputs=[self.sim_occupancy, self.active_list, self.active_counter],
+                  device="cuda")
+        self.num_active_blocks = int(self.active_counter.numpy()[0])
+        active_voxels = self.num_active_blocks * self.block_size ** 3
+
         # 2. Vorticity Confinement (every 2nd frame)
         if self.frame % 2 == 0:
             wp.launch(
-                compute_vorticity, dim=total,
+                compute_vorticity, dim=active_voxels,
                 inputs=[self.vel_x, self.vel_y, self.vel_z,
-                        self.omega_x, self.omega_y, self.omega_z, self.omega_mag, n,
-                        self.sim_occupancy, self.block_size],
+                        self.omega_x, self.omega_y, self.omega_z, self.omega_mag,
+                        self.active_list, n, self.block_size],
                 device="cuda",
             )
             wp.launch(
-                apply_vorticity_confinement, dim=total,
+                apply_vorticity_confinement, dim=active_voxels,
                 inputs=[self.vel_x, self.vel_y, self.vel_z,
                         self.omega_x, self.omega_y, self.omega_z, self.omega_mag,
-                        n, 0.5, dt,  # stronger epsilon to compensate for skipping
-                        self.sim_occupancy, self.block_size],
+                        self.active_list, n, 0.5, dt, self.block_size],
                 device="cuda",
             )
 
         # 3. Diffuse velocity (fused: 1 launch instead of 3)
+        self.vx_buf.zero_()
+        self.vy_buf.zero_()
+        self.vz_buf.zero_()
         wp.launch(
-            diffuse_velocity_fused, dim=total,
+            diffuse_velocity_fused, dim=active_voxels,
             inputs=[self.vel_x, self.vel_y, self.vel_z,
                     self.vx_buf, self.vy_buf, self.vz_buf,
-                    n, 0.2,
-                    self.sim_occupancy, self.block_size],
+                    self.active_list, n, 0.2, self.block_size],
             device="cuda",
         )
         self.vel_x, self.vx_buf = self.vx_buf, self.vel_x
@@ -1268,80 +1268,50 @@ class FireSim:
             half_n = self.half_n
             half_total = self.half_total
 
-            # zero_() must happen outside graph capture
             self.half_pressure.zero_()
+            self.divergence.zero_()
 
-            if self._jacobi_graph is None:
-                try:
-                    wp.capture_begin(device="cuda")
-                    # Compute divergence on full grid
-                    wp.launch(compute_divergence, dim=total,
-                              inputs=[self.vel_x, self.vel_y, self.vel_z, self.divergence, n,
-                                      self.sim_occupancy, self.block_size],
-                              device="cuda")
-                    # Downsample divergence to half grid
-                    wp.launch(downsample_field, dim=half_total,
-                              inputs=[self.divergence, self.half_divergence, n, half_n],
-                              device="cuda")
-                    # 5 Red-Black Gauss-Seidel iterations on half grid
-                    for _ in range(5):
-                        wp.launch(rb_gauss_seidel_step, dim=half_total,
-                                  inputs=[self.half_pressure, self.half_divergence, half_n, 0,
-                                          self.half_occupancy, self.half_block_size],
-                                  device="cuda")
-                        wp.launch(rb_gauss_seidel_step, dim=half_total,
-                                  inputs=[self.half_pressure, self.half_divergence, half_n, 1,
-                                          self.half_occupancy, self.half_block_size],
-                                  device="cuda")
-                    # Upsample pressure back to full grid
-                    wp.launch(upsample_field, dim=total,
-                              inputs=[self.half_pressure, self.pressure, half_n, n],
-                              device="cuda")
-                    # Subtract pressure gradient on full grid
-                    wp.launch(subtract_pressure_gradient, dim=total,
-                              inputs=[self.vel_x, self.vel_y, self.vel_z, self.pressure, n,
-                                      self.sim_occupancy, self.block_size],
-                              device="cuda")
-                    self._jacobi_graph = wp.capture_end(device="cuda")
-                except Exception:
-                    self._jacobi_graph = None
-
-            if self._jacobi_graph is not None:
-                wp.capture_launch(self._jacobi_graph)
-            else:
-                # Fallback without graph
-                wp.launch(compute_divergence, dim=total,
-                          inputs=[self.vel_x, self.vel_y, self.vel_z, self.divergence, n,
-                                  self.sim_occupancy, self.block_size],
+            # Compute divergence on active voxels only
+            wp.launch(compute_divergence, dim=active_voxels,
+                      inputs=[self.vel_x, self.vel_y, self.vel_z, self.divergence,
+                              self.active_list, n, self.block_size],
+                      device="cuda")
+            # Downsample divergence to half grid
+            wp.launch(downsample_field, dim=half_total,
+                      inputs=[self.divergence, self.half_divergence, n, half_n],
+                      device="cuda")
+            # 5 Red-Black Gauss-Seidel iterations on half grid
+            for _ in range(5):
+                wp.launch(rb_gauss_seidel_step, dim=half_total,
+                          inputs=[self.half_pressure, self.half_divergence, half_n, 0,
+                                  self.half_occupancy, self.half_block_size],
                           device="cuda")
-                wp.launch(downsample_field, dim=half_total,
-                          inputs=[self.divergence, self.half_divergence, n, half_n],
+                wp.launch(rb_gauss_seidel_step, dim=half_total,
+                          inputs=[self.half_pressure, self.half_divergence, half_n, 1,
+                                  self.half_occupancy, self.half_block_size],
                           device="cuda")
-                for _ in range(5):
-                    wp.launch(rb_gauss_seidel_step, dim=half_total,
-                              inputs=[self.half_pressure, self.half_divergence, half_n, 0,
-                                      self.half_occupancy, self.half_block_size],
-                              device="cuda")
-                    wp.launch(rb_gauss_seidel_step, dim=half_total,
-                              inputs=[self.half_pressure, self.half_divergence, half_n, 1,
-                                      self.half_occupancy, self.half_block_size],
-                              device="cuda")
-                wp.launch(upsample_field, dim=total,
-                          inputs=[self.half_pressure, self.pressure, half_n, n],
-                          device="cuda")
-                wp.launch(subtract_pressure_gradient, dim=total,
-                          inputs=[self.vel_x, self.vel_y, self.vel_z, self.pressure, n,
-                                  self.sim_occupancy, self.block_size],
-                          device="cuda")
+            # Upsample pressure back to full grid
+            wp.launch(upsample_field, dim=total,
+                      inputs=[self.half_pressure, self.pressure, half_n, n],
+                      device="cuda")
+            # Subtract pressure gradient on active voxels
+            wp.launch(subtract_pressure_gradient, dim=active_voxels,
+                      inputs=[self.vel_x, self.vel_y, self.vel_z, self.pressure,
+                              self.active_list, n, self.block_size],
+                      device="cuda")
 
         # 5. Advect all fields (temp, density, velocity) in single kernel
-        wp.launch(advect_all_fused, dim=total,
+        self.temp_buf.zero_()
+        self.dens_buf.zero_()
+        self.vx_buf.zero_()
+        self.vy_buf.zero_()
+        self.vz_buf.zero_()
+        wp.launch(advect_all_fused, dim=active_voxels,
                   inputs=[self.temperature, self.temp_buf,
                           self.density, self.dens_buf,
                           self.vel_x, self.vel_y, self.vel_z,
                           self.vx_buf, self.vy_buf, self.vz_buf,
-                          n, dt,
-                          self.sim_occupancy, self.block_size],
+                          self.active_list, n, dt, self.block_size],
                   device="cuda")
         self.temperature, self.temp_buf = self.temp_buf, self.temperature
         self.density, self.dens_buf = self.dens_buf, self.density
