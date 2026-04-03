@@ -940,6 +940,42 @@ def compact_active_blocks(
         active_list[slot] = tid
 
 
+@wp.kernel
+def zero_active_3(
+    a: wp.array(dtype=float),
+    b: wp.array(dtype=float),
+    c: wp.array(dtype=float),
+    active_list: wp.array(dtype=int),
+    n: int,
+    block_size: int,
+):
+    """Zero 3 arrays, only for active block voxels."""
+    i, j, k, tid = voxel_from_active_tid(active_list, wp.tid(), n, block_size)
+    a[tid] = 0.0
+    b[tid] = 0.0
+    c[tid] = 0.0
+
+
+@wp.kernel
+def zero_active_5(
+    a: wp.array(dtype=float),
+    b: wp.array(dtype=float),
+    c: wp.array(dtype=float),
+    d: wp.array(dtype=float),
+    e: wp.array(dtype=float),
+    active_list: wp.array(dtype=int),
+    n: int,
+    block_size: int,
+):
+    """Zero 5 arrays, only for active block voxels."""
+    i, j, k, tid = voxel_from_active_tid(active_list, wp.tid(), n, block_size)
+    a[tid] = 0.0
+    b[tid] = 0.0
+    c[tid] = 0.0
+    d[tid] = 0.0
+    e[tid] = 0.0
+
+
 @wp.func
 def voxel_from_active_tid(
     active_list: wp.array(dtype=int),
@@ -1249,9 +1285,10 @@ class FireSim:
             )
 
         # 3. Diffuse velocity (fused: 1 launch instead of 3)
-        self.vx_buf.zero_()
-        self.vy_buf.zero_()
-        self.vz_buf.zero_()
+        wp.launch(zero_active_3, dim=active_voxels,
+                  inputs=[self.vx_buf, self.vy_buf, self.vz_buf,
+                          self.active_list, n, self.block_size],
+                  device="cuda")
         wp.launch(
             diffuse_velocity_fused, dim=active_voxels,
             inputs=[self.vel_x, self.vel_y, self.vel_z,
@@ -1302,11 +1339,10 @@ class FireSim:
                       device="cuda")
 
         # 5. Advect all fields (temp, density, velocity) in single kernel
-        self.temp_buf.zero_()
-        self.dens_buf.zero_()
-        self.vx_buf.zero_()
-        self.vy_buf.zero_()
-        self.vz_buf.zero_()
+        wp.launch(zero_active_5, dim=active_voxels,
+                  inputs=[self.temp_buf, self.dens_buf, self.vx_buf, self.vy_buf, self.vz_buf,
+                          self.active_list, n, self.block_size],
+                  device="cuda")
         wp.launch(advect_all_fused, dim=active_voxels,
                   inputs=[self.temperature, self.temp_buf,
                           self.density, self.dens_buf,
