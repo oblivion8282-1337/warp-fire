@@ -1614,6 +1614,7 @@ def main():
 
     pygame.display.set_caption(f"Warp Fire | Grid {grid_size}")
     clock = pygame.time.Clock()
+    cuda_dev = wp.get_device("cuda:0")
 
     def draw_text(surf, x, y, text, color=(255, 255, 255), scale=2):
         cx = x
@@ -1745,7 +1746,6 @@ def main():
         res_str = "HALF" if half_res else "FULL"
         gl_str = " GL" if use_gl else ""
         temp_str = f"  SKIP:{render_every}" if render_every > 1 else ""
-        cuda_dev = wp.get_device("cuda:0")
         vram_used_mb = (cuda_dev.total_memory - cuda_dev.free_memory) / (1024 * 1024)
         vram_total_gb = cuda_dev.total_memory / (1024 * 1024 * 1024)
         info_top = f"FPS: {fps:.0f}  Sim: {sim_ms:.1f}ms  Render: {render_ms:.1f}ms"
