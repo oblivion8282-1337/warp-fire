@@ -1280,38 +1280,55 @@ class FireSim:
             half_n = self.half_n
             half_total = self.half_total
 
-            # Compute divergence on full grid
-            wp.launch(compute_divergence, dim=total,
-                      inputs=[self.vel_x, self.vel_y, self.vel_z, self.divergence, n,
-                              self.sim_occupancy, self.block_size],
-                      device="cuda")
-
-            # Downsample divergence to half grid
-            wp.launch(downsample_field, dim=half_total,
-                      inputs=[self.divergence, self.half_divergence, n, half_n],
-                      device="cuda")
-
-            # Solve pressure on half grid via Red-Black Gauss-Seidel
+            # zero_() must happen outside graph capture
             self.half_pressure.zero_()
+
             if self._jacobi_graph is None:
                 try:
                     wp.capture_begin(device="cuda")
-                    wp.launch(rb_gauss_seidel_step, dim=half_total,
-                              inputs=[self.half_pressure, self.half_divergence, half_n, 0,
-                                      self.half_occupancy, self.half_block_size],
+                    # Compute divergence on full grid
+                    wp.launch(compute_divergence, dim=total,
+                              inputs=[self.vel_x, self.vel_y, self.vel_z, self.divergence, n,
+                                      self.sim_occupancy, self.block_size],
                               device="cuda")
-                    wp.launch(rb_gauss_seidel_step, dim=half_total,
-                              inputs=[self.half_pressure, self.half_divergence, half_n, 1,
-                                      self.half_occupancy, self.half_block_size],
+                    # Downsample divergence to half grid
+                    wp.launch(downsample_field, dim=half_total,
+                              inputs=[self.divergence, self.half_divergence, n, half_n],
+                              device="cuda")
+                    # 5 Red-Black Gauss-Seidel iterations on half grid
+                    for _ in range(5):
+                        wp.launch(rb_gauss_seidel_step, dim=half_total,
+                                  inputs=[self.half_pressure, self.half_divergence, half_n, 0,
+                                          self.half_occupancy, self.half_block_size],
+                                  device="cuda")
+                        wp.launch(rb_gauss_seidel_step, dim=half_total,
+                                  inputs=[self.half_pressure, self.half_divergence, half_n, 1,
+                                          self.half_occupancy, self.half_block_size],
+                                  device="cuda")
+                    # Upsample pressure back to full grid
+                    wp.launch(upsample_field, dim=total,
+                              inputs=[self.half_pressure, self.pressure, half_n, n],
+                              device="cuda")
+                    # Subtract pressure gradient on full grid
+                    wp.launch(subtract_pressure_gradient, dim=total,
+                              inputs=[self.vel_x, self.vel_y, self.vel_z, self.pressure, n,
+                                      self.sim_occupancy, self.block_size],
                               device="cuda")
                     self._jacobi_graph = wp.capture_end(device="cuda")
                 except Exception:
                     self._jacobi_graph = None
 
             if self._jacobi_graph is not None:
-                for _ in range(5):  # 5 replays x (red+black) = 5 RB-GS iterations
-                    wp.capture_launch(self._jacobi_graph)
+                wp.capture_launch(self._jacobi_graph)
             else:
+                # Fallback without graph
+                wp.launch(compute_divergence, dim=total,
+                          inputs=[self.vel_x, self.vel_y, self.vel_z, self.divergence, n,
+                                  self.sim_occupancy, self.block_size],
+                          device="cuda")
+                wp.launch(downsample_field, dim=half_total,
+                          inputs=[self.divergence, self.half_divergence, n, half_n],
+                          device="cuda")
                 for _ in range(5):
                     wp.launch(rb_gauss_seidel_step, dim=half_total,
                               inputs=[self.half_pressure, self.half_divergence, half_n, 0,
@@ -1321,17 +1338,13 @@ class FireSim:
                               inputs=[self.half_pressure, self.half_divergence, half_n, 1,
                                       self.half_occupancy, self.half_block_size],
                               device="cuda")
-
-            # Upsample pressure back to full grid
-            wp.launch(upsample_field, dim=total,
-                      inputs=[self.half_pressure, self.pressure, half_n, n],
-                      device="cuda")
-
-            # Subtract pressure gradient on full grid
-            wp.launch(subtract_pressure_gradient, dim=total,
-                      inputs=[self.vel_x, self.vel_y, self.vel_z, self.pressure, n,
-                              self.sim_occupancy, self.block_size],
-                      device="cuda")
+                wp.launch(upsample_field, dim=total,
+                          inputs=[self.half_pressure, self.pressure, half_n, n],
+                          device="cuda")
+                wp.launch(subtract_pressure_gradient, dim=total,
+                          inputs=[self.vel_x, self.vel_y, self.vel_z, self.pressure, n,
+                                  self.sim_occupancy, self.block_size],
+                          device="cuda")
 
         # 5. Advect all fields (temp, density, velocity) in single kernel
         wp.launch(advect_all_fused, dim=total,
