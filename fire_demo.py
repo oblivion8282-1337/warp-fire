@@ -1137,6 +1137,20 @@ def bloom_combine(
     )
 
 
+@wp.kernel
+def vec3_to_bgra8(
+    src: wp.array(dtype=wp.vec3),
+    dst: wp.array(dtype=wp.uint32),
+):
+    """Convert float RGB image to packed BGRA8 for Vulkan swapchain."""
+    tid = wp.tid()
+    c = src[tid]
+    r = wp.uint32(wp.clamp(c[0] * 255.0, 0.0, 255.0))
+    g = wp.uint32(wp.clamp(c[1] * 255.0, 0.0, 255.0))
+    b = wp.uint32(wp.clamp(c[2] * 255.0, 0.0, 255.0))
+    dst[tid] = b | (g << wp.uint32(8)) | (r << wp.uint32(16)) | (wp.uint32(255) << wp.uint32(24))
+
+
 # ─── Simulation ────────────────────────────────────────────────
 
 
@@ -1597,23 +1611,40 @@ def main():
     bloom_a_half = wp.zeros(HALF_W * HALF_H, dtype=wp.vec3, device="cuda")
     bloom_b_half = wp.zeros(HALF_W * HALF_H, dtype=wp.vec3, device="cuda")
 
-    pygame.init()
-
-    # Try OpenGL interop (zero-copy), fallback to surfarray
+    # Try Vulkan interop → OpenGL interop → surfarray fallback
+    use_vk = False
     use_gl = False
     gl_interop = None
-    try:
-        from pygame.locals import OPENGL, DOUBLEBUF
-        screen = pygame.display.set_mode((IMG_W, IMG_H), OPENGL | DOUBLEBUF)
-        gl_interop = GLInterop(IMG_W, IMG_H)
-        use_gl = True
-        print("OpenGL Interop: ACTIVE (zero-copy)")
-    except Exception as e:
-        print(f"OpenGL Interop failed ({e}), using surfarray fallback")
-        screen = pygame.display.set_mode((IMG_W, IMG_H))
+    vk_bgra_buf = None
+    screen = None
 
-    pygame.display.set_caption(f"Warp Fire | Grid {grid_size}")
-    clock = pygame.time.Clock()
+    try:
+        import vk_interop
+        cuda_ptr = vk_interop.init(IMG_W, IMG_H, "Warp Fire (Vulkan)")
+        vk_bgra_buf = wp.array(ptr=cuda_ptr, dtype=wp.uint32, shape=(IMG_W * IMG_H,), device="cuda")
+        use_vk = True
+        print("Vulkan Interop: ACTIVE (zero-copy, no map/unmap)")
+    except Exception as e:
+        print(f"Vulkan Interop failed ({e}), trying OpenGL...")
+        import pygame
+        pygame.init()
+        try:
+            from pygame.locals import OPENGL, DOUBLEBUF
+            screen = pygame.display.set_mode((IMG_W, IMG_H), OPENGL | DOUBLEBUF)
+            gl_interop = GLInterop(IMG_W, IMG_H)
+            use_gl = True
+            print("OpenGL Interop: ACTIVE (zero-copy)")
+        except Exception as e2:
+            print(f"OpenGL Interop failed ({e2}), using surfarray fallback")
+            screen = pygame.display.set_mode((IMG_W, IMG_H))
+        pygame.display.set_caption(f"Warp Fire | Grid {grid_size}")
+
+    if not use_vk:
+        import pygame
+        clock = pygame.time.Clock()
+    else:
+        clock = None
+
     cuda_dev = wp.get_device("cuda:0")
 
     def draw_text(surf, x, y, text, color=(255, 255, 255), scale=2):
@@ -1671,24 +1702,53 @@ def main():
     render_ms = 0.0
     print(f"Performance log: {log_path}")
 
+    # SDL key codes (for Vulkan path which uses SDL directly)
+    SDLK_ESCAPE = 27
+    SDLK_UP = 1073741906
+    SDLK_DOWN = 1073741905
+    SDLK_r = ord('r')
+    SDLK_h = ord('h')
+    SDLK_t = ord('t')
+    SDLK_PLUS = ord('+')
+    SDLK_MINUS = ord('-')
+
     running = True
     while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
+        if use_vk:
+            for ev in vk_interop.poll_events():
+                if ev["type"] == "quit":
                     running = False
-                elif event.key == pygame.K_r:
-                    sim.reset()
-                elif event.key == pygame.K_h:
-                    half_res = not half_res
-                elif event.key == pygame.K_t:
-                    render_every = 3 if render_every == 1 else 1
-                elif event.key in (pygame.K_UP, pygame.K_PLUS, pygame.K_KP_PLUS):
-                    set_grid(grid_idx + 1)
-                elif event.key in (pygame.K_DOWN, pygame.K_MINUS, pygame.K_KP_MINUS):
-                    set_grid(grid_idx - 1)
+                elif ev["type"] == "keydown":
+                    key = ev["key"]
+                    if key == SDLK_ESCAPE:
+                        running = False
+                    elif key == SDLK_r:
+                        sim.reset()
+                    elif key == SDLK_h:
+                        half_res = not half_res
+                    elif key == SDLK_t:
+                        render_every = 3 if render_every == 1 else 1
+                    elif key in (SDLK_UP, SDLK_PLUS):
+                        set_grid(grid_idx + 1)
+                    elif key in (SDLK_DOWN, SDLK_MINUS):
+                        set_grid(grid_idx - 1)
+        else:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+                    elif event.key == pygame.K_r:
+                        sim.reset()
+                    elif event.key == pygame.K_h:
+                        half_res = not half_res
+                    elif event.key == pygame.K_t:
+                        render_every = 3 if render_every == 1 else 1
+                    elif event.key in (pygame.K_UP, pygame.K_PLUS, pygame.K_KP_PLUS):
+                        set_grid(grid_idx + 1)
+                    elif event.key in (pygame.K_DOWN, pygame.K_MINUS, pygame.K_KP_MINUS):
+                        set_grid(grid_idx - 1)
 
         # Simulate
         t0 = time.perf_counter()
@@ -1702,7 +1762,15 @@ def main():
         if do_render:
             t0 = time.perf_counter()
 
-            if use_gl and not half_res:
+            if use_vk:
+                # === Vulkan Interop path: true zero-copy, no map/unmap ===
+                sim.render(IMG_W, IMG_H, image_buf, bloom_a, bloom_b)
+                wp.launch(vec3_to_bgra8, dim=IMG_W * IMG_H,
+                          inputs=[image_buf, vk_bgra_buf], device="cuda")
+                wp.synchronize()
+                render_ms = (time.perf_counter() - t0) * 1000.0
+                vk_interop.present()
+            elif use_gl and not half_res:
                 # === OpenGL Interop path: zero-copy ===
                 gl_buf = gl_interop.map_to_warp()
                 sim.render(IMG_W, IMG_H, gl_buf, bloom_a, bloom_b)
@@ -1733,18 +1801,21 @@ def main():
 
                 screen.blit(last_surf, (0, 0))
 
-        elif not use_gl and last_surf is not None:
+        elif not use_vk and not use_gl and last_surf is not None:
             screen.blit(last_surf, (0, 0))
 
-        # HUD (surfarray mode only — OpenGL mode shows in title)
-        fps = clock.get_fps()
+        # HUD
+        if clock:
+            fps = clock.get_fps()
+        else:
+            fps = 1000.0 / max(sim_ms + render_ms + 0.1, 0.1)
         voxels = grid_size ** 3
         if voxels >= 1_000_000:
             voxel_str = f"{voxels / 1_000_000:.1f}M"
         else:
             voxel_str = f"{voxels // 1000}K"
         res_str = "HALF" if half_res else "FULL"
-        gl_str = " GL" if use_gl else ""
+        gl_str = " VK" if use_vk else (" GL" if use_gl else "")
         temp_str = f"  SKIP:{render_every}" if render_every > 1 else ""
         vram_used_mb = (cuda_dev.total_memory - cuda_dev.free_memory) / (1024 * 1024)
         vram_total_gb = cuda_dev.total_memory / (1024 * 1024 * 1024)
@@ -1752,8 +1823,11 @@ def main():
         info_grid = f"Grid: {grid_size}^3 ({voxel_str})  {res_str}{gl_str}  VRAM: {vram_used_mb:.0f}MB/{vram_total_gb:.1f}GB{temp_str}"
         info_controls = "Up/Down=Grid  H=HalfRes  T=Temporal  R=Reset  ESC=Quit"
 
-        if use_gl:
-            # GL mode: HUD in window title (zero render cost)
+        if use_vk:
+            # Vulkan mode: HUD in window title via SDL
+            vk_interop.set_title(f"Warp Fire | {info_top} | {info_grid}")
+        elif use_gl:
+            # GL mode: HUD in window title
             pygame.display.set_caption(
                 f"Warp Fire | {info_top} | {info_grid}")
         else:
@@ -1770,21 +1844,25 @@ def main():
                 f"{now:.2f}", f"{fps:.1f}", f"{sim_ms:.2f}", f"{render_ms:.2f}",
                 grid_size, grid_size**3,
                 "HALF" if half_res else "FULL",
-                "GL" if use_gl else "SW",
+                "VK" if use_vk else ("GL" if use_gl else "SW"),
                 render_every,
             ])
             log_file.flush()
             last_log_time = now
             print(f"\r{info_top} | {info_grid}", end="", flush=True)
 
-        pygame.display.flip()
-        clock.tick(0)
+        if not use_vk:
+            pygame.display.flip()
+            clock.tick(0)
 
     log_file.close()
-    print(f"Log saved: {log_path}")
-    if gl_interop is not None:
-        gl_interop.cleanup()
-    pygame.quit()
+    print(f"\nLog saved: {log_path}")
+    if use_vk:
+        vk_interop.cleanup()
+    else:
+        if gl_interop is not None:
+            gl_interop.cleanup()
+        pygame.quit()
 
 
 if __name__ == "__main__":
