@@ -94,21 +94,49 @@ def sim_step_fused(
     # --- Forces: buoyancy + turbulence ---
     vy = vy + t * buoyancy * dt
 
-    if t > 0.05:
-        # Curl noise: divergence-free turbulence from Perlin noise potential
-        noise_scale = 0.06
-        time_val = float(frame) * 0.015
-        pos = wp.vec4(
-            float(i) * noise_scale,
-            float(j) * noise_scale,
-            float(k) * noise_scale,
+    if t > 0.01 or d > 0.01:
+        # Multi-octave curl noise for turbulent, chaotic fire shapes
+        height_frac = float(j) / float(n)
+        time_val = float(frame) * 0.03
+
+        # Octave 1: Large-scale swirling (dominant structure)
+        pos1 = wp.vec4(
+            float(i) * 0.04,
+            float(j) * 0.04,
+            float(k) * 0.04,
             time_val,
         )
-        curl = curl_noise_3d(pos, 0.5)
-        strength = turbulence * t * dt
-        vx = vx + curl[0] * strength
-        vy = vy + curl[1] * strength * 0.3  # less vertical turbulence
-        vz = vz + curl[2] * strength
+        curl1 = curl_noise_3d(pos1, 0.3)
+
+        # Octave 2: Medium detail
+        pos2 = wp.vec4(
+            float(i) * 0.09,
+            float(j) * 0.09,
+            float(k) * 0.09,
+            time_val * 1.7,
+        )
+        curl2 = curl_noise_3d(pos2, 0.2)
+
+        # Octave 3: Fine flickering detail
+        pos3 = wp.vec4(
+            float(i) * 0.2,
+            float(j) * 0.2,
+            float(k) * 0.2,
+            time_val * 3.1,
+        )
+        curl3 = curl_noise_3d(pos3, 0.15)
+
+        # Combine octaves: large + 0.5*medium + 0.25*fine
+        cx = curl1[0] + 0.5 * curl2[0] + 0.25 * curl3[0]
+        cy = curl1[1] + 0.5 * curl2[1] + 0.25 * curl3[1]
+        cz = curl1[2] + 0.5 * curl2[2] + 0.25 * curl3[2]
+
+        # Strength increases with height (more chaotic as fire rises)
+        activity = wp.max(t, d * 0.5)
+        strength = turbulence * activity * dt * (1.0 + height_frac * 1.5)
+        vx = vx + cx * strength
+        vy = vy + cy * strength * 0.5  # some vertical turbulence (was 0.3)
+        vz = vz + cz * strength
 
     # --- Dissipate ---
     temperature[tid] = wp.max(t * temp_decay, 0.0)
@@ -814,19 +842,26 @@ def render_fire(
         # Precomputed light transmittance (replaces 16-step shadow loop)
         light_atten = float(light_vol[idx])
 
-        # Fire color: blackbody (self-emitting)
-        cr = wp.clamp(t * 5.0, 0.0, 1.0)
-        cg = wp.clamp(t * 2.5 - 0.2, 0.0, 1.0)
-        cb = wp.clamp(t * 1.2 - 0.5, 0.0, 1.0)
-        emit = wp.clamp(t * 2.0, 0.0, 1.0)
+        # Fire color: physically-inspired blackbody curve
+        # Dark red → orange → yellow → white → slight blue at extreme heat
+        t2 = wp.clamp(t, 0.0, 1.2)
+        cr = wp.clamp(t2 * 3.0, 0.0, 1.0)
+        cg = wp.clamp(t2 * t2 * 4.0 - 0.1, 0.0, 1.0)
+        cb = wp.clamp(t2 * t2 * t2 * 6.0 - 0.3, 0.0, 1.0)
+        # Allow HDR emission > 1.0 for hot cores (tone-mapped later)
+        emit = t2 * 3.0
 
-        # Smoke: lit by directional light + ambient + fire glow (phase_norm precomputed above)
-        ambient = 0.025
-        smoke_bright = ambient + 0.1 * light_atten * phase_norm
-        fire_illum = wp.clamp(t * 0.3, 0.0, 0.15)
-        smoke_r = smoke_bright + fire_illum * 1.0
-        smoke_g = smoke_bright + fire_illum * 0.4
-        smoke_b = smoke_bright + fire_illum * 0.15
+        # Smoke: variable color based on temperature and height
+        height_frac = float(gj) / float(n)  # 0=bottom, 1=top
+        ambient = 0.02 + 0.01 * (1.0 - height_frac)  # brighter near bottom
+        smoke_bright = ambient + 0.12 * light_atten * phase_norm
+        # Fire illumination on nearby smoke (stronger than before)
+        fire_illum = wp.clamp(t * 0.6, 0.0, 0.35)
+        # Smoke darkens with height (cooler, denser particles)
+        smoke_albedo = 0.8 - 0.4 * height_frac
+        smoke_r = (smoke_bright + fire_illum * 1.0) * smoke_albedo
+        smoke_g = (smoke_bright + fire_illum * 0.35) * smoke_albedo
+        smoke_b = (smoke_bright + fire_illum * 0.1) * smoke_albedo
 
         fire_a = wp.clamp(t * 0.6, 0.0, 1.0) * step
         smoke_a = wp.clamp(d * 0.2, 0.0, 0.4) * step
@@ -845,6 +880,24 @@ def render_fire(
             alpha = alpha + contrib
 
         k = k + 1
+
+    # Background gradient: dark blue → black (top to bottom)
+    py_norm = float(img_h - 1 - py) / float(img_h)  # 0=bottom, 1=top
+    bg_r = 0.008
+    bg_g = 0.008 + 0.015 * py_norm
+    bg_b = 0.025 + 0.04 * py_norm
+    r = r + bg_r * (1.0 - alpha)
+    g = g + bg_g * (1.0 - alpha)
+    b = b + bg_b * (1.0 - alpha)
+
+    # ACES Filmic Tone-Mapping (HDR → LDR)
+    exposure = 0.6
+    r = r * exposure
+    g = g * exposure
+    b = b * exposure
+    r = (r * (2.51 * r + 0.03)) / (r * (2.43 * r + 0.59) + 0.14)
+    g = (g * (2.51 * g + 0.03)) / (g * (2.43 * g + 0.59) + 0.14)
+    b = (b * (2.51 * b + 0.03)) / (b * (2.43 * b + 0.59) + 0.14)
 
     image[pid] = wp.vec3(
         wp.clamp(r, 0.0, 1.0),
@@ -1142,12 +1195,16 @@ def vec3_to_bgra8(
     src: wp.array(dtype=wp.vec3),
     dst: wp.array(dtype=wp.uint32),
 ):
-    """Convert float RGB image to packed BGRA8 for Vulkan swapchain."""
+    """Convert linear float RGB to sRGB BGRA8 for Vulkan swapchain."""
     tid = wp.tid()
     c = src[tid]
-    r = wp.uint32(wp.clamp(c[0] * 255.0, 0.0, 255.0))
-    g = wp.uint32(wp.clamp(c[1] * 255.0, 0.0, 255.0))
-    b = wp.uint32(wp.clamp(c[2] * 255.0, 0.0, 255.0))
+    # sRGB gamma (approximate: pow 1/2.2 ≈ pow 0.4545)
+    sr = wp.pow(wp.clamp(c[0], 0.0, 1.0), 0.4545)
+    sg = wp.pow(wp.clamp(c[1], 0.0, 1.0), 0.4545)
+    sb = wp.pow(wp.clamp(c[2], 0.0, 1.0), 0.4545)
+    r = wp.uint32(sr * 255.0)
+    g = wp.uint32(sg * 255.0)
+    b = wp.uint32(sb * 255.0)
     dst[tid] = b | (g << wp.uint32(8)) | (r << wp.uint32(16)) | (wp.uint32(255) << wp.uint32(24))
 
 
@@ -1254,7 +1311,7 @@ class FireSim:
                 self.vel_x, self.vel_y, self.vel_z,
                 self.active_list,
                 n, self.frame,
-                0.8, 1.5, dt,     # buoyancy, turbulence, dt
+                0.8, 2.5, dt,     # buoyancy, turbulence, dt
                 0.96, 0.95, 0.94,  # temp_decay, dens_decay, vel_decay
                 self.block_size,
             ],
