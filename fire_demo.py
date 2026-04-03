@@ -74,7 +74,7 @@ def sim_step_fused(
     vy = vel_y[tid]
     vz = vel_z[tid]
 
-    # --- Emit fire at source (bottom center) ---
+    # --- Emit fire at source (bottom center, noise-modulated) ---
     if j < 8:
         cx = float(n) / 2.0
         cz = float(n) / 2.0
@@ -87,8 +87,16 @@ def sim_step_fused(
         if dist < radius:
             falloff = 1.0 - dist / radius
             falloff = falloff * falloff
-            t = t + 0.8 * falloff
-            d = d + 0.4 * falloff
+            # Noise-modulated emission: irregular fire base
+            emit_noise = wp.noise(wp.uint32(5), wp.vec4(
+                float(i) * 0.12,
+                float(k) * 0.12,
+                float(frame) * 0.06,
+                0.0,
+            ))
+            emit_mod = 0.7 + 0.6 * emit_noise  # range ~0.1-1.3
+            t = t + 0.8 * falloff * emit_mod
+            d = d + 0.4 * falloff * emit_mod
             vy = vy + 0.3 * falloff
 
     # --- Forces: buoyancy + turbulence ---
@@ -839,6 +847,18 @@ def render_fire(
             k = k + 1
             continue
 
+        # Procedural detail: high-frequency noise modulates density/temperature
+        # Adds fine structure beyond grid resolution (cheap VFX trick)
+        detail_pos = wp.vec4(
+            float(gi) * 0.15,
+            float(gj) * 0.15,
+            float(k) * 0.15,
+            float(k) * 0.02,  # slight variation along ray
+        )
+        detail = wp.noise(wp.uint32(7), detail_pos) * 0.4 + 1.0  # range ~0.6-1.4
+        t = t * detail
+        d = d * detail
+
         # Precomputed light transmittance (replaces 16-step shadow loop)
         light_atten = float(light_vol[idx])
 
@@ -1338,22 +1358,21 @@ class FireSim:
         self.num_active_blocks = int(self.active_counter.numpy()[0])
         active_voxels = self.num_active_blocks * self.block_size ** 3
 
-        # 2. Vorticity Confinement (every 2nd frame)
-        if self.frame % 2 == 0:
-            wp.launch(
-                compute_vorticity, dim=active_voxels,
-                inputs=[self.vel_x, self.vel_y, self.vel_z,
-                        self.omega_x, self.omega_y, self.omega_z, self.omega_mag,
-                        self.active_list, n, self.block_size],
-                device="cuda",
-            )
-            wp.launch(
-                apply_vorticity_confinement, dim=active_voxels,
-                inputs=[self.vel_x, self.vel_y, self.vel_z,
-                        self.omega_x, self.omega_y, self.omega_z, self.omega_mag,
-                        self.active_list, n, 0.5, dt, self.block_size],
-                device="cuda",
-            )
+        # 2. Vorticity Confinement (every frame, stronger for more detail)
+        wp.launch(
+            compute_vorticity, dim=active_voxels,
+            inputs=[self.vel_x, self.vel_y, self.vel_z,
+                    self.omega_x, self.omega_y, self.omega_z, self.omega_mag,
+                    self.active_list, n, self.block_size],
+            device="cuda",
+        )
+        wp.launch(
+            apply_vorticity_confinement, dim=active_voxels,
+            inputs=[self.vel_x, self.vel_y, self.vel_z,
+                    self.omega_x, self.omega_y, self.omega_z, self.omega_mag,
+                    self.active_list, n, 0.8, dt, self.block_size],
+            device="cuda",
+        )
 
         # 3. Diffuse velocity (fused: 1 launch instead of 3)
         wp.launch(zero_active_3, dim=active_voxels,
