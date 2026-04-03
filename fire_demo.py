@@ -918,32 +918,20 @@ def build_occupancy(
     n: int,
     block_size: int,
 ):
-    """Mark 8x8x8 blocks as occupied if any voxel has content."""
+    """Mark 8x8x8 blocks as occupied if any voxel has content. One thread per voxel."""
     tid = wp.tid()
-    blocks_per_dim = n // block_size
-    b2 = blocks_per_dim * blocks_per_dim
-    bi = tid // b2
-    bj = (tid // blocks_per_dim) % blocks_per_dim
-    bk = tid % blocks_per_dim
-
     n2 = n * n
-    occupied = int(0)
-    for li in range(block_size):
-        if occupied == 1:
-            break
-        for lj in range(block_size):
-            if occupied == 1:
-                break
-            for lk in range(block_size):
-                gi = bi * block_size + li
-                gj = bj * block_size + lj
-                gk = bk * block_size + lk
-                if gi < n and gj < n and gk < n:
-                    idx = gi * n2 + gj * n + gk
-                    if temperature[idx] > 0.01 or density[idx] > 0.01:
-                        occupied = 1
+    i = tid // n2
+    j = (tid // n) % n
+    k = tid % n
 
-    occupancy[tid] = occupied
+    if temperature[tid] > 0.01 or density[tid] > 0.01:
+        bpd = n // block_size
+        bi = i // block_size
+        bj = j // block_size
+        bk = k // block_size
+        block_idx = bi * bpd * bpd + bj * bpd + bk
+        wp.atomic_max(occupancy, block_idx, 1)
 
 
 @wp.kernel
@@ -1234,7 +1222,7 @@ class FireSim:
 
         # 2. Build dilated occupancy AFTER emission (so new fire is visible)
         self.occ_undilated.zero_()
-        wp.launch(build_occupancy, dim=self.occ_total,
+        wp.launch(build_occupancy, dim=total,
                   inputs=[self.temperature, self.density, self.occ_undilated,
                           n, self.block_size],
                   device="cuda")
@@ -1376,7 +1364,7 @@ class FireSim:
         self.compute_lighting()
         # Build occupancy grid for adaptive ray marching
         self.occupancy.zero_()
-        wp.launch(build_occupancy, dim=self.occ_total,
+        wp.launch(build_occupancy, dim=self.n ** 3,
                   inputs=[self.temperature, self.density, self.occupancy,
                           self.n, self.block_size],
                   device="cuda")
